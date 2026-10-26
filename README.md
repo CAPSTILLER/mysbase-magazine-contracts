@@ -3,7 +3,7 @@
 Foundry, Solidity 0.8.24, OpenZeppelin v5.1. Built for Base. **Nothing is deployed yet.**
 
 ## MagazineKey (ERC-721, `src/MagazineKey.sol`)
-Permanent gate keys for the magazine rooms: one collection, one pool, and a key never changes.
+Genesis collection ("Mysbase Genesis Key" / MYSGEN in the deploy script): permanent gate keys for the magazine rooms, with a hard cap of **MAX_SUPPLY = 10,000**. `addEntries` reverts with `MaxSupply` past that, so minting can never exceed it. More keys later would need a new contract. RoomPass is unlimited.
 - **Pool:** Cap loads entries with `addEntries(rarities[], traits[], uris[])`. Rarity: 0 Common, 1 Uncommon, 2 Rare, 3 Mythic. Trait: 1 Grass, 2 Mountain, 3 Snowy Tundra, 4 Ocean, 5 Outer Space, 6 Desert, 7 Forest. Fix typos with `setEntryURI(idx, uri)`, then `lockPool()` freezes the pool and opens minting.
 - **Mint:** `mint()` pays `mintPrice` (10 USDC) to the treasury (0xCF1ac98565DA846E8263604b49C1276Ed78A0981) and gives a random key from the remaining pool. It reverts with `SoldOut` when the pool is empty.
   - Default randomness uses prevrandao + blockhash. On Base the sequencer could in theory bias it, and a contract caller can retry by reverting, so it is fine for fun pulls only. `setRandomSource` can plug in a VRF adapter.

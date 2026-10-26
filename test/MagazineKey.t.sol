@@ -356,6 +356,24 @@ contract MagazineKeyTest is Test {
         assertEq(p.balanceOf(address(p), 1), 1); assertTrue(m.canEnter(bob, 0));
     }
 
+    function test_maxSupply10000() public {
+        assertEq(m.MAX_SUPPLY(), 10_000);
+        uint256 b = 1000;
+        MagazineKey.Rarity[] memory r = new MagazineKey.Rarity[](b); uint8[] memory t = new uint8[](b); string[] memory u = new string[](b);
+        for (uint256 i; i < b; i++) t[i] = 1;
+        vm.startPrank(LEDGER);
+        for (uint256 k; k < 10; k++) m.addEntries(r, t, u);
+        assertEq(m.poolSize(), 10_000);
+        MagazineKey.Rarity[] memory r1 = new MagazineKey.Rarity[](1); uint8[] memory t1 = new uint8[](1); string[] memory u1 = new string[](1); t1[0] = 1;
+        vm.expectRevert(MagazineKey.MaxSupply.selector); m.addEntries(r1, t1, u1);
+        vm.stopPrank();
+    }
+    function test_maxSupplySingleBatchOver() public {
+        uint256 b = 10_001;
+        MagazineKey.Rarity[] memory r = new MagazineKey.Rarity[](b); uint8[] memory t = new uint8[](b); string[] memory u = new string[](b);
+        vm.prank(LEDGER); vm.expectRevert(MagazineKey.MaxSupply.selector); m.addEntries(r, t, u);
+    }
+
     // ---------- admin ----------
     function test_ownerSettersAndTwoStep() public {
         _add(MagazineKey.Rarity.Common, 1);
@@ -375,6 +393,6 @@ contract MagazineKeyTest is Test {
     }
     function test_constructorNameConfigurable() public {
         MagazineKey k = new MagazineKey("Other", "OTH", LEDGER, address(usdc), TREASURY, 1, address(key), 1);
-        assertEq(k.name(), "Other"); assertEq(m.name(), "Mysbase Magazine Key");
+        assertEq(k.name(), "Other"); assertEq(m.name(), "Mysbase Magazine Key") /* test instance name */;
     }
 }

@@ -45,6 +45,8 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     enum Rarity { Common, Uncommon, Rare, Mythic }
 
     /// Traits: 1 Grass, 2 Mountain, 3 Snowy Tundra, 4 Ocean, 5 Outer Space, 6 Desert, 7 Forest.
+    /// @notice Hard cap: the pool (and so total mints) can never exceed 10,000 keys.
+    uint256 public constant MAX_SUPPLY = 10_000;
     uint8 public constant ANY = 0;
     uint8 public constant GRASS = 1;
     uint8 public constant MOUNTAIN = 2;
@@ -94,7 +96,7 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     event RoomPassSet(address pass);
 
     error ZeroAddress(); error PoolIsLocked(); error PoolNotLocked(); error SoldOut(); error BadTrait();
-    error LengthMismatch(); error NotOperator(); error EmptyPool(); error RoomExists(); error NoRoom(); error NotOpen();
+    error LengthMismatch(); error NotOperator(); error EmptyPool(); error MaxSupply(); error RoomExists(); error NoRoom(); error NotOpen();
 
     constructor(string memory name_, string memory symbol_, address owner_, address usdc_, address treasury_,
         uint256 price_, address key_, uint256 keyTokenId_)
@@ -110,6 +112,7 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
         if (poolLocked) revert PoolIsLocked();
         if (rarities.length != traits.length || traits.length != uris.length) revert LengthMismatch();
         uint256 from = _entries.length;
+        if (from + traits.length > MAX_SUPPLY) revert MaxSupply();
         for (uint256 i; i < traits.length; i++) {
             if (traits[i] < GRASS || traits[i] > FOREST) revert BadTrait();
             _entries.push(Entry(rarities[i], traits[i], uris[i]));
