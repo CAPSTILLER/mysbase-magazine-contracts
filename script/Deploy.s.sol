@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 import {Script} from "forge-std/Script.sol";
-import {MagazineIssue} from "../src/MagazineIssue.sol";
+import {MagazineKey} from "../src/MagazineKey.sol";
 import {RoomPass} from "../src/RoomPass.sol";
 
 /// Deploys both contracts owned by Cap's Ledger. No keys in repo: run with --ledger or --account.
@@ -14,8 +14,10 @@ contract Deploy is Script {
 
     function run() external {
         vm.startBroadcast();
-        new MagazineIssue(LEDGER, USDC, TREASURY, 10e6, CAPS_MIND_KEY, KEY_TOKEN_ID);
-        new RoomPass(LEDGER, USDC, TREASURY, 1e6, "");
+        // Owner is the Ledger, so the Ledger must afterwards call: setRoomPass(pass), seedDefaultRooms(),
+        // addEntries(...) batches, lockPool(), startRoom(id, time).
+        MagazineKey k = new MagazineKey("Mysbase Magazine Key", "MYSKEY", LEDGER, USDC, TREASURY, 10e6, CAPS_MIND_KEY, KEY_TOKEN_ID);
+        new RoomPass(LEDGER, USDC, TREASURY, 1e6, address(k), "");
         vm.stopBroadcast();
     }
 }
