@@ -37,7 +37,7 @@ contract MagazineKeyTest is Test {
     }
     // single deterministic entry, minted to `to`
     function _one(MagazineKey.Rarity r, uint8 t, address to) internal returns (uint256 id) {
-        _add(r, t); vm.prank(LEDGER); m.lockPool(); vm.prank(to); id = m.mint();
+        _add(r, t); vm.prank(LEDGER); m.lockPool(); vm.prank(to, to); id = m.mint();
     }
     function _start(uint256 room, uint64 t) internal { vm.prank(LEDGER); m.startRoom(room, t); }
 
@@ -46,7 +46,7 @@ contract MagazineKeyTest is Test {
         _load(3, false);
         vm.prank(LEDGER); m.setEntryURI(0, "fixed");
         assertEq(m.entry(0).uri, "fixed");
-        vm.prank(alice); vm.expectRevert(MagazineKey.PoolNotLocked.selector); m.mint();
+        vm.prank(alice, alice); vm.expectRevert(MagazineKey.PoolNotLocked.selector); m.mint();
         vm.prank(LEDGER); m.lockPool();
         vm.startPrank(LEDGER);
         vm.expectRevert(MagazineKey.PoolIsLocked.selector); m.setEntryURI(0, "x");
@@ -70,26 +70,26 @@ contract MagazineKeyTest is Test {
         bool[] memory seen = new bool[](n);
         for (uint256 i; i < n; i++) {
             vm.prevrandao(bytes32(uint256(keccak256(abi.encode(i)))));
-            vm.prank(alice); uint256 id = m.mint();
+            vm.prank(alice, alice); uint256 id = m.mint();
             uint256 e = m.entryOf(id); assertFalse(seen[e]); seen[e] = true;
             assertEq(m.tokenURI(id), string.concat("ipfs://e/", vm.toString(e)));
         }
         assertEq(m.remaining(), 0); assertEq(m.balanceOf(alice), n);
-        vm.prank(alice); vm.expectRevert(MagazineKey.SoldOut.selector); m.mint();
+        vm.prank(alice, alice); vm.expectRevert(MagazineKey.SoldOut.selector); m.mint();
     }
     function test_swappableRandomSource() public {
         _load(5, true);
         vm.prank(LEDGER); m.setRandomSource(address(rnd));
-        rnd.set(3); vm.prank(alice); uint256 id = m.mint(); assertEq(m.entryOf(id), 3);
+        rnd.set(3); vm.prank(alice, alice); uint256 id = m.mint(); assertEq(m.entryOf(id), 3);
         vm.prank(alice); vm.expectRevert(); m.setRandomSource(address(0));
     }
     function test_mintPaysTreasury() public {
         _load(2, true);
         uint256 b = usdc.balanceOf(TREASURY);
-        vm.prank(alice); m.mint();
+        vm.prank(alice, alice); m.mint();
         assertEq(usdc.balanceOf(TREASURY) - b, 10e6);
         vm.prank(LEDGER); m.pause();
-        vm.prank(alice); vm.expectRevert(Pausable.EnforcedPause.selector); m.mint();
+        vm.prank(alice, alice); vm.expectRevert(Pausable.EnforcedPause.selector); m.mint();
     }
 
     // ---------- rooms: who can control ----------
@@ -132,7 +132,7 @@ contract MagazineKeyTest is Test {
         vm.prank(LEDGER); m.setRandomSource(address(rnd));
         uint256[4] memory ids;
         // remaining list swaps; always pick last so order = 3,2,1,0
-        for (uint256 i; i < 4; i++) { rnd.set(3 - i); vm.prank(alice); ids[i] = m.mint(); }
+        for (uint256 i; i < 4; i++) { rnd.set(3 - i); vm.prank(alice, alice); ids[i] = m.mint(); }
         _start(0, T0);
         uint256[4] memory dur = [uint256(7 days), 14 days, 30 days, type(uint256).max];
         for (uint256 i; i < 4; i++) {
@@ -386,7 +386,7 @@ contract MagazineKeyTest is Test {
         vm.prank(alice); m.acceptOwnership(); assertEq(m.owner(), alice);
         vm.prank(alice); m.lockPool();
         uint256 b = usdc.balanceOf(bob);
-        vm.prank(cap); m.mint();
+        vm.prank(cap, cap); m.mint();
         assertEq(usdc.balanceOf(bob) - b, 5e6);
         vm.prank(bob); vm.expectRevert(); m.setMintPrice(1);
         vm.prank(bob); vm.expectRevert(); p.setPrice(1);
@@ -395,4 +395,31 @@ contract MagazineKeyTest is Test {
         MagazineKey k = new MagazineKey("Other", "OTH", LEDGER, address(usdc), TREASURY, 1, address(key), 1);
         assertEq(k.name(), "Other"); assertEq(m.name(), "Mysbase Magazine Key") /* test instance name */;
     }
+
+    // ---------- anti-reroll ----------
+    function test_mint_rejectsContractCaller() public {
+        _add(MagazineKey.Rarity.Common, 1); vm.prank(LEDGER); m.lockPool();
+        Reroller c = new Reroller(m);
+        usdc.mint(address(c), 100e6);
+        vm.prank(alice, alice); vm.expectRevert(MagazineKey.ContractCallerNotAllowed.selector); c.go();
+    }
+    function test_mint_eoaSucceeds() public {
+        _add(MagazineKey.Rarity.Common, 1); vm.prank(LEDGER); m.lockPool();
+        vm.prank(alice, alice); uint256 id = m.mint(); assertEq(m.ownerOf(id), alice);
+    }
+    function test_mint_rejects7702DelegatedEoa() public {
+        _add(MagazineKey.Rarity.Common, 1); vm.prank(LEDGER); m.lockPool();
+        vm.etch(alice, abi.encodePacked(hex"ef0100", address(0xBEEF))); // 7702-style delegation designator
+        vm.prank(alice, alice); vm.expectRevert(MagazineKey.ContractCallerNotAllowed.selector); m.mint();
+    }
+    function test_mint_rejectsSpoofedOriginMismatch() public {
+        _add(MagazineKey.Rarity.Common, 1); vm.prank(LEDGER); m.lockPool();
+        vm.prank(alice, bob); vm.expectRevert(MagazineKey.ContractCallerNotAllowed.selector); m.mint();
+    }
+}
+
+contract Reroller {
+    MagazineKey m;
+    constructor(MagazineKey _m) { m = _m; }
+    function go() external { Mock6(address(m.usdc())).approve(address(m), type(uint256).max); m.mint(); }
 }

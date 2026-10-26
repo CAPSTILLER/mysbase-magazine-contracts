@@ -96,7 +96,7 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     event RoomPassSet(address pass);
 
     error ZeroAddress(); error PoolIsLocked(); error PoolNotLocked(); error SoldOut(); error BadTrait();
-    error LengthMismatch(); error NotOperator(); error EmptyPool(); error MaxSupply(); error RoomExists(); error NoRoom(); error NotOpen();
+    error LengthMismatch(); error NotOperator(); error EmptyPool(); error MaxSupply(); error RoomExists(); error ContractCallerNotAllowed(); error NoRoom(); error NotOpen();
 
     constructor(string memory name_, string memory symbol_, address owner_, address usdc_, address treasury_,
         uint256 price_, address key_, uint256 keyTokenId_)
@@ -208,6 +208,10 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     // ---------------- mint ----------------
     /// @notice Pay mintPrice USDC to treasury, get a random key from the remaining pool.
     function mint() external whenNotPaused nonReentrant returns (uint256 tokenId) {
+        // Anti-reroll: only plain EOAs may mint. Blocks contracts (incl. constructor calls via
+        // tx.origin check) and EIP-7702 delegated EOAs (code.length check) that could revert
+        // after inspecting the pulled rarity. Note: smart-contract wallets cannot mint.
+        if (msg.sender != tx.origin || msg.sender.code.length != 0) revert ContractCallerNotAllowed();
         if (!poolLocked) revert PoolNotLocked();
         uint256 n = _remaining.length;
         if (n == 0) revert SoldOut();
