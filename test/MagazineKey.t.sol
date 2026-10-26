@@ -99,16 +99,17 @@ contract MagazineKeyTest is Test {
     function test_roomControlOwnerAndKeyHolderOnly() public {
         vm.prank(cap); m.createRoom(42, 0);
         vm.prank(cap); m.startRoom(42, T0); assertTrue(m.roomOpen(42));
-        vm.prank(cap); m.cancelRoom(42); assertFalse(m.roomOpen(42));
+        vm.prank(cap); m.shutDownRoom(42); assertFalse(m.roomOpen(42));
         vm.prank(LEDGER); m.startRoom(42, T0); assertTrue(m.roomOpen(42));
         vm.startPrank(alice);
         vm.expectRevert(MagazineKey.NotOperator.selector); m.createRoom(43, 0);
         vm.expectRevert(MagazineKey.NotOperator.selector); m.startRoom(42, T0);
-        vm.expectRevert(MagazineKey.NotOperator.selector); m.cancelRoom(42);
+        vm.expectRevert(MagazineKey.NotOperator.selector); m.shutDownRoom(42);
+        vm.expectRevert(MagazineKey.NotOperator.selector); m.quarantineRoom(42);
         vm.stopPrank();
         // key moves -> control moves
         vm.prank(cap); key.transferFrom(cap, alice, 1);
-        vm.prank(alice); m.cancelRoom(42);
+        vm.prank(alice); m.shutDownRoom(42);
         vm.prank(cap); vm.expectRevert(MagazineKey.NotOperator.selector); m.startRoom(42, T0);
         // setKey retargets token id
         key.mint(bob, 9); vm.prank(LEDGER); m.setKey(address(key), 9);
@@ -119,7 +120,8 @@ contract MagazineKeyTest is Test {
         vm.expectRevert(MagazineKey.RoomExists.selector); m.createRoom(0, 0);
         vm.expectRevert(MagazineKey.BadTrait.selector); m.createRoom(50, 8);
         vm.expectRevert(MagazineKey.NoRoom.selector); m.startRoom(99, T0);
-        vm.expectRevert(MagazineKey.NoRoom.selector); m.cancelRoom(99);
+        vm.expectRevert(MagazineKey.NoRoom.selector); m.shutDownRoom(99);
+        vm.expectRevert(MagazineKey.NoRoom.selector); m.quarantineRoom(99);
         vm.expectRevert(MagazineKey.BadStart.selector); m.startRoom(0, 0);
         vm.stopPrank();
     }
@@ -167,18 +169,61 @@ contract MagazineKeyTest is Test {
         _start(0, T0); _start(1, T0 + 5 days);
         vm.warp(T0 + 8 days);
         assertFalse(m.canEnter(alice, 0)); assertTrue(m.canEnter(alice, 1));
-        vm.prank(LEDGER); m.cancelRoom(1);
+        vm.prank(LEDGER); m.shutDownRoom(1);
         assertFalse(m.canEnter(alice, 1));
     }
-    function test_mythicForeverButCancelBlocks() public {
-        _one(MagazineKey.Rarity.Mythic, 4, alice);
-        _start(0, T0); _start(4, T0);
+    function test_mythicFreeReign() public {
+        uint256 id = _one(MagazineKey.Rarity.Mythic, 4, alice); // Ocean
+        _start(0, T0); _start(4, T0); _start(6, T0); // 6 = Desert, other trait
         vm.warp(T0 + 3650 days);
-        assertTrue(m.canEnter(alice, 0)); assertTrue(m.canEnter(alice, 4));
-        vm.prank(cap); m.cancelRoom(4);
-        assertFalse(m.canEnter(alice, 4)); assertTrue(m.canEnter(alice, 0));
-        assertEq(m.accessEnds(1, 4), 0);
-        _start(4, uint64(block.timestamp)); assertTrue(m.canEnter(alice, 4));
+        assertTrue(m.canEnter(alice, 0)); assertTrue(m.canEnter(alice, 4)); assertTrue(m.canEnter(alice, 6));
+        assertEq(m.accessEnds(id, 6), type(uint256).max);
+        assertFalse(m.canEnter(alice, 5)); // never started
+        vm.prank(cap); m.shutDownRoom(6);
+        assertTrue(m.canEnter(alice, 6)); // Mythic in shut-down room
+        vm.prank(LEDGER); m.quarantineRoom(6);
+        assertFalse(m.canEnter(alice, 6)); assertEq(m.accessEnds(id, 6), 0);
+        _start(6, uint64(block.timestamp)); assertTrue(m.canEnter(alice, 6));
+    }
+    function test_shutDownBlocksNonMythic() public {
+        _one(MagazineKey.Rarity.Rare, 1, alice);
+        _start(1, T0); assertTrue(m.canEnter(alice, 1));
+        vm.prank(LEDGER); m.shutDownRoom(1); assertFalse(m.canEnter(alice, 1));
+        vm.prank(LEDGER); m.quarantineRoom(1); assertFalse(m.canEnter(alice, 1));
+        _start(1, T0 + 1); vm.warp(T0 + 1); assertTrue(m.canEnter(alice, 1));
+    }
+    function test_capAlwaysIn() public {
+        vm.prank(LEDGER); m.createRoom(55, 3);
+        for (uint256 r; r < 3; r++) {
+            if (r == 1) _start(55, T0);
+            if (r == 2) { vm.prank(LEDGER); m.quarantineRoom(55); }
+            assertTrue(m.canEnter(LEDGER, 55)); assertTrue(m.canEnter(cap, 55));
+            assertTrue(m.canEnter(cap, 0)); assertFalse(m.canEnter(bob, 55));
+        }
+        vm.prank(LEDGER); m.shutDownRoom(55); assertTrue(m.canEnter(cap, 55));
+        vm.prank(cap); key.transferFrom(cap, bob, 1);
+        assertFalse(m.canEnter(cap, 55)); assertTrue(m.canEnter(bob, 55));
+    }
+    function test_viewsForOtherContracts() public {
+        uint256 id = _one(MagazineKey.Rarity.Uncommon, 7, alice);
+        (address h, MagazineKey.Rarity r, uint8 t, string memory u) = m.keyInfo(id);
+        assertEq(h, alice); assertEq(uint8(r), 1); assertEq(t, 7); assertEq(u, "ipfs://e/0");
+        (bool ex, MagazineKey.RoomState st, uint8 rt, uint64 s0, bool open) = m.roomState(7);
+        assertTrue(ex); assertEq(uint8(st), 0); assertEq(rt, 7); assertEq(s0, 0); assertFalse(open);
+        _start(7, T0);
+        (, st,,, open) = m.roomState(7); assertEq(uint8(st), 1); assertTrue(open);
+        vm.prank(LEDGER); m.quarantineRoom(7);
+        (, st,,, open) = m.roomState(7); assertEq(uint8(st), 3); assertFalse(open);
+    }
+    function test_passRefusedWhenNotOpen() public {
+        vm.prank(bob); p.buy(3); _start(0, T0);
+        vm.prank(LEDGER); m.quarantineRoom(0);
+        vm.prank(bob); vm.expectRevert(RoomPass.RoomClosed.selector); p.use(0);
+        _start(0, T0 + 1 days); // open but start not reached
+        vm.prank(bob); vm.expectRevert(RoomPass.RoomClosed.selector); p.use(0);
+        vm.warp(T0 + 1 days); vm.prank(bob); p.use(0); assertTrue(m.canEnter(bob, 0));
+        vm.prank(LEDGER); m.quarantineRoom(0); assertFalse(m.canEnter(bob, 0));
+        assertEq(p.balanceOf(bob, 1), 2);
     }
 
     // ---------- trait gating & transfer ----------
@@ -218,14 +263,14 @@ contract MagazineKeyTest is Test {
         vm.prank(bob); p.buy(2);
         vm.prank(bob); vm.expectRevert(RoomPass.RoomClosed.selector); p.use(0); // never started
         vm.prank(bob); vm.expectRevert(RoomPass.RoomClosed.selector); p.use(77); // no room
-        _start(0, T0); vm.prank(LEDGER); m.cancelRoom(0);
+        _start(0, T0); vm.prank(LEDGER); m.shutDownRoom(0);
         vm.prank(bob); vm.expectRevert(RoomPass.RoomClosed.selector); p.use(0);
         assertEq(p.balanceOf(bob, 1), 2); // nothing burned
     }
     function test_activePassStopsWhenRoomCancelled() public {
         vm.prank(bob); p.buy(1); _start(0, T0);
         vm.prank(bob); p.use(0); assertTrue(m.canEnter(bob, 0));
-        vm.prank(cap); m.cancelRoom(0);
+        vm.prank(cap); m.shutDownRoom(0);
         assertFalse(m.canEnter(bob, 0)); assertFalse(p.hasPassAccess(bob, 0));
     }
     function test_passNeedsBalanceAndRespectsPause() public {

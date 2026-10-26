@@ -11,8 +11,8 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 interface IRooms { function roomOpen(uint256 roomId) external view returns (bool); }
 
 /// @title Mysbase Room Pass — one-time 24h pass for one room.
-/// @notice A pass only works in an OPEN room (created, started, not cancelled). use() refuses
-///         closed rooms so nobody burns a pass for nothing; an active pass stops working if the room is cancelled.
+/// @notice A pass only works in an OPEN, started room. use() refuses other rooms so nobody burns a pass
+///         for nothing; an active pass stops working while the room is ShutDown or Quarantined.
 contract RoomPass is ERC1155, Ownable2Step, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 

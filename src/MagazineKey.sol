@@ -26,8 +26,13 @@ interface IRoomPassView {
 /// @notice One collection, one pool. Keys never change. Each room has its OWN clock:
 ///         when a room is started/reset, every eligible holder gets a fresh window from that
 ///         room's startTime: Common 7d, Uncommon 14d, Rare 30d, Mythic forever
-///         (forever = while the room stays started and not cancelled).
-///         A CANCELLED room gives NO NFT access to anyone, Mythic included, until it is started again.
+///         Room states: NotStarted, Open, ShutDown, Quarantined.
+///         - Open: rarity windows from startTime + trait gating + RoomPasses.
+///         - ShutDown: only Mythic holders and Cap (owner / current CAPs Mind key holder).
+///         - Quarantined: only Cap. Mythic locked out.
+///         Mythic holders ignore trait gating and time limits in any Open (started) or ShutDown room.
+///         Cap (owner or current CAPs Mind key holder) can always enter every room.
+///         canEnter / roomState / keyInfo are stable external views for a future custom-rooms contract.
 /// @dev Randomness: by default uses block.prevrandao + blockhash + nonce + minter. On Base the
 ///      sequencer produces blocks and could in theory bias outcomes, and a contract caller can
 ///      simulate and revert unwanted pulls. Fine for a fun pull, not for high-value odds.
@@ -47,10 +52,11 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     uint8 public constant DESERT = 6;
     uint8 public constant FOREST = 7;
 
+    enum RoomState { NotStarted, Open, ShutDown, Quarantined }
+
     struct Entry { Rarity rarity; uint8 trait; string uri; }
     /// requiredTrait 0 = any key holder; 1..7 = only holders of that trait.
-    /// startTime 0 = never started. cancelled = closed to all NFT access and passes.
-    struct Room { bool exists; uint8 requiredTrait; bool cancelled; uint64 startTime; }
+    struct Room { bool exists; uint8 requiredTrait; RoomState state; uint64 startTime; }
 
     IERC20 public immutable usdc;
     address public treasury;
@@ -74,7 +80,8 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     event PoolLocked(uint256 size);
     event RoomCreated(uint256 indexed roomId, uint8 requiredTrait);
     event RoomStarted(uint256 indexed roomId, uint64 startTime, address by);
-    event RoomCancelled(uint256 indexed roomId, address by);
+    event RoomShutDown(uint256 indexed roomId, address by);
+    event RoomQuarantined(uint256 indexed roomId, address by);
     event Minted(address indexed to, uint256 indexed tokenId, uint256 entry, Rarity rarity, uint8 trait);
     event MintPriceSet(uint256 price);
     event TreasurySet(address treasury);
@@ -135,7 +142,7 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     function createRoom(uint256 roomId, uint8 requiredTrait) public onlyOperator {
         if (rooms[roomId].exists) revert RoomExists();
         if (requiredTrait > FOREST) revert BadTrait();
-        rooms[roomId] = Room(true, requiredTrait, false, 0);
+        rooms[roomId] = Room(true, requiredTrait, RoomState.NotStarted, 0);
         emit RoomCreated(roomId, requiredTrait);
     }
 
@@ -144,29 +151,42 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
         for (uint8 i; i <= FOREST; i++) if (!rooms[i].exists) createRoom(i, i);
     }
 
-    /// @notice Start or reset a room's clock (also re-opens a cancelled room). Every eligible holder
-    ///         gets a fresh window from startTime. Owner or current CAPs Mind key holder.
+    /// @notice Open/reopen a room and start or reset its clock: every eligible holder gets a fresh
+    ///         window from startTime. Owner or current CAPs Mind key holder.
     function startRoom(uint256 roomId, uint64 startTime) external onlyOperator {
-        Room storage r = rooms[roomId];
-        if (!r.exists) revert NoRoom();
+        Room storage r = _room(roomId);
         if (startTime == 0) revert BadStart();
-        r.startTime = startTime; r.cancelled = false;
+        r.startTime = startTime; r.state = RoomState.Open;
         emit RoomStarted(roomId, startTime, msg.sender);
     }
 
-    /// @notice Close a room: NO key access (Mythic included) and passes stop working/can't be used,
-    ///         until startRoom is called again.
-    function cancelRoom(uint256 roomId) external onlyOperator {
-        Room storage r = rooms[roomId];
-        if (!r.exists) revert NoRoom();
-        r.cancelled = true;
-        emit RoomCancelled(roomId, msg.sender);
+    /// @notice Shut a room down: only Mythic holders and Cap can enter; passes stop working.
+    function shutDownRoom(uint256 roomId) external onlyOperator {
+        _room(roomId).state = RoomState.ShutDown;
+        emit RoomShutDown(roomId, msg.sender);
     }
 
-    /// @notice Room exists, has been started, start time reached, not cancelled.
+    /// @notice Quarantine a room: only Cap can enter. Mythic holders and passes locked out.
+    function quarantineRoom(uint256 roomId) external onlyOperator {
+        _room(roomId).state = RoomState.Quarantined;
+        emit RoomQuarantined(roomId, msg.sender);
+    }
+
+    function _room(uint256 roomId) internal view returns (Room storage r) {
+        r = rooms[roomId];
+        if (!r.exists) revert NoRoom();
+    }
+
+    /// @notice Room is Open and its start time has been reached (normal rules + passes apply).
     function roomOpen(uint256 roomId) public view returns (bool) {
         Room storage r = rooms[roomId];
-        return r.exists && !r.cancelled && r.startTime != 0 && block.timestamp >= r.startTime;
+        return r.exists && r.state == RoomState.Open && block.timestamp >= r.startTime;
+    }
+
+    /// @notice Clean view for other contracts/apps.
+    function roomState(uint256 roomId) external view returns (bool exists, RoomState state, uint8 requiredTrait, uint64 startTime, bool open) {
+        Room storage r = rooms[roomId];
+        return (r.exists, r.state, r.requiredTrait, r.startTime, roomOpen(roomId));
     }
 
     // ---------------- mint ----------------
@@ -205,34 +225,47 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     function remaining() external view returns (uint256) { return _remaining.length; }
     function entry(uint256 idx) external view returns (Entry memory) { return _entries[idx]; }
 
+    /// @notice Clean view for other contracts/apps: a key's permanent rarity, trait, uri and current owner.
+    function keyInfo(uint256 tokenId) external view returns (address holder, Rarity rarity, uint8 trait, string memory uri) {
+        holder = _requireOwned(tokenId);
+        Entry storage e = _entries[entryOf[tokenId]];
+        return (holder, e.rarity, e.trait, e.uri);
+    }
+
     function tokenInfo(uint256 tokenId) external view returns (Rarity rarity, uint8 trait, string memory uri) {
         _requireOwned(tokenId);
         Entry storage e = _entries[entryOf[tokenId]];
         return (e.rarity, e.trait, e.uri);
     }
 
-    /// @notice When this key's window in a room ends. 0 = no access (wrong trait / room not open);
-    ///         type(uint256).max = forever (Mythic, while room stays open).
+    /// @notice When this key's access to a room ends. 0 = no access now;
+    ///         type(uint256).max = no time limit (Mythic in an Open or ShutDown room).
     function accessEnds(uint256 tokenId, uint256 roomId) public view returns (uint256) {
         _requireOwned(tokenId);
-        if (!roomOpen(roomId)) return 0;
         Room storage r = rooms[roomId];
+        if (!r.exists) return 0;
         Entry storage e = _entries[entryOf[tokenId]];
+        if (e.rarity == Rarity.Mythic) {
+            if (r.state == RoomState.ShutDown || roomOpen(roomId)) return type(uint256).max;
+            return 0;
+        }
+        if (!roomOpen(roomId)) return 0;
         if (r.requiredTrait != ANY && r.requiredTrait != e.trait) return 0;
-        uint256 d = durationOf(e.rarity);
-        return d == type(uint256).max ? d : r.startTime + d;
+        return r.startTime + durationOf(e.rarity);
     }
 
     function keyCanEnter(uint256 tokenId, uint256 roomId) public view returns (bool) {
         return block.timestamp < accessEnds(tokenId, roomId);
     }
 
-    /// @notice True if wallet holds a qualifying key within its window, or has an active RoomPass for the room.
+    /// @notice True if wallet is Cap (owner / current CAPs Mind key holder, any room, any state),
+    ///         holds a key with access now, or has an active RoomPass for this (Open) room.
     function canEnter(address wallet, uint256 roomId) external view returns (bool) {
-        if (!roomOpen(roomId)) return false;
+        if (isOperator(wallet)) return true;
+        if (!rooms[roomId].exists) return false;
         uint256 n = balanceOf(wallet);
         for (uint256 i; i < n; i++) if (keyCanEnter(tokenOfOwnerByIndex(wallet, i), roomId)) return true;
-        if (address(roomPass) != address(0)) return roomPass.hasPassAccess(wallet, roomId);
+        if (address(roomPass) != address(0) && roomOpen(roomId)) return roomPass.hasPassAccess(wallet, roomId);
         return false;
     }
 
