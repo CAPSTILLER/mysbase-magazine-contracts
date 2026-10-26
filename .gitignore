@@ -1,0 +1,8 @@
+out/
+cache/
+lib/
+node_modules/
+.vercel/
+dist/
+broadcast/
+.env
