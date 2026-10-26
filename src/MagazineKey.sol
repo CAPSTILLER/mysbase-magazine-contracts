@@ -121,6 +121,7 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
         if (usdc_ == address(0) || treasury_ == address(0)) revert ZeroAddress();
         usdc = IERC20(usdc_); treasury = treasury_; mintPrice = price_;
         keyContract = IKeyNFT(key_); keyTokenId = keyTokenId_;
+        _pause(); // launches paused; owner calls unpause() when ready
     }
 
     // ---------------- pool (owner, before lock) ----------------

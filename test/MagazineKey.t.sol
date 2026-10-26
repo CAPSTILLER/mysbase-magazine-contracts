@@ -20,7 +20,8 @@ contract MagazineKeyTest is Test {
         usdc = new Mock6(); key = new MockKey(); key.mint(cap, 1); rnd = new FixedRandom();
         m = new MagazineKey("Mysbase Magazine Key", "MYSKEY", LEDGER, address(usdc), TREASURY, 10e6, address(key), 1);
         p = new RoomPass(LEDGER, address(usdc), TREASURY, 1e6, address(m), "ipfs://pass/{id}.json");
-        vm.startPrank(LEDGER); m.setRoomPass(address(p)); m.seedDefaultRooms(); vm.stopPrank();
+        assertTrue(m.paused()); assertTrue(p.paused());
+        vm.startPrank(LEDGER); m.setRoomPass(address(p)); m.seedDefaultRooms(); m.unpause(); p.unpause(); vm.stopPrank();
         address[3] memory us = [alice, bob, cap];
         for (uint256 i; i < 3; i++) { usdc.mint(us[i], 1_000_000e6); vm.startPrank(us[i]); usdc.approve(address(m), type(uint256).max); usdc.approve(address(p), type(uint256).max); vm.stopPrank(); }
     }
@@ -397,6 +398,16 @@ contract MagazineKeyTest is Test {
     function test_constructorNameConfigurable() public {
         MagazineKey k = new MagazineKey("Other", "OTH", LEDGER, address(usdc), TREASURY, 1, address(key), 1);
         assertEq(k.name(), "Other"); assertEq(m.name(), "Mysbase Magazine Key") /* test instance name */;
+    }
+
+    function test_launchesPaused() public {
+        MagazineKey k = new MagazineKey("K", "K", LEDGER, address(usdc), TREASURY, 10e6, address(key), 1);
+        RoomPass rp = new RoomPass(LEDGER, address(usdc), TREASURY, 1e6, address(k), "");
+        assertTrue(k.paused()); assertTrue(rp.paused());
+        vm.prank(alice); vm.expectRevert(); rp.buy(1);
+        vm.prank(alice); vm.expectRevert(); k.mint();
+        vm.prank(bob); vm.expectRevert(); rp.unpause();
+        vm.prank(LEDGER); rp.unpause(); assertFalse(rp.paused());
     }
 
     // ---------- commit-reveal ----------

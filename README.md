@@ -41,3 +41,7 @@ A separate "custom rooms" contract (user-built rooms, Cap approval to go public,
 
 ## Test
 `forge test`
+
+## Launch state
+
+Both contracts deploy **paused** (owner = Ledger). Minting keys and buying/using passes revert until the Ledger calls `unpause()` on each.

@@ -53,6 +53,7 @@ contract RoomPass is ERC1155, Ownable2Step, Pausable, ReentrancyGuard {
         usdc = IERC20(usdc_); treasury = treasury_; price = price_;
         if (rooms_ == address(0)) revert ZeroAddress();
         rooms = IRooms(rooms_);
+        _pause(); // launches paused; owner calls unpause() when ready
     }
 
     function buy(uint256 amount) external whenNotPaused nonReentrant {
