@@ -122,7 +122,7 @@ contract MagazineKeyTest is Test {
         vm.expectRevert(MagazineKey.NoRoom.selector); m.startRoom(99, T0);
         vm.expectRevert(MagazineKey.NoRoom.selector); m.shutDownRoom(99);
         vm.expectRevert(MagazineKey.NoRoom.selector); m.quarantineRoom(99);
-        vm.expectRevert(MagazineKey.BadStart.selector); m.startRoom(0, 0);
+        vm.expectRevert(MagazineKey.NotOpen.selector); m.shutDownRoom(0); // never opened
         vm.stopPrank();
     }
 
@@ -200,7 +200,7 @@ contract MagazineKeyTest is Test {
             assertTrue(m.canEnter(LEDGER, 55)); assertTrue(m.canEnter(cap, 55));
             assertTrue(m.canEnter(cap, 0)); assertFalse(m.canEnter(bob, 55));
         }
-        vm.prank(LEDGER); m.shutDownRoom(55); assertTrue(m.canEnter(cap, 55));
+        _start(55, T0); vm.prank(LEDGER); m.shutDownRoom(55); assertTrue(m.canEnter(cap, 55));
         vm.prank(cap); key.transferFrom(cap, bob, 1);
         assertFalse(m.canEnter(cap, 55)); assertTrue(m.canEnter(bob, 55));
     }
@@ -209,11 +209,11 @@ contract MagazineKeyTest is Test {
         (address h, MagazineKey.Rarity r, uint8 t, string memory u) = m.keyInfo(id);
         assertEq(h, alice); assertEq(uint8(r), 1); assertEq(t, 7); assertEq(u, "ipfs://e/0");
         (bool ex, MagazineKey.RoomState st, uint8 rt, uint64 s0, bool open) = m.roomState(7);
-        assertTrue(ex); assertEq(uint8(st), 0); assertEq(rt, 7); assertEq(s0, 0); assertFalse(open);
+        assertTrue(ex); assertEq(uint8(st), 0); assertEq(rt, 7); assertEq(s0, 0); assertFalse(open); // Quarantined by default
         _start(7, T0);
         (, st,,, open) = m.roomState(7); assertEq(uint8(st), 1); assertTrue(open);
         vm.prank(LEDGER); m.quarantineRoom(7);
-        (, st,,, open) = m.roomState(7); assertEq(uint8(st), 3); assertFalse(open);
+        (, st,,, open) = m.roomState(7); assertEq(uint8(st), 0); assertFalse(open);
     }
     function test_passRefusedWhenNotOpen() public {
         vm.prank(bob); p.buy(3); _start(0, T0);
@@ -279,6 +279,81 @@ contract MagazineKeyTest is Test {
         vm.prank(bob); vm.expectRevert(RoomPass.ZeroAmount.selector); p.buy(0);
         vm.prank(LEDGER); p.pause();
         vm.prank(bob); vm.expectRevert(Pausable.EnforcedPause.selector); p.buy(1);
+    }
+
+    // ---------- round: quarantine default + pass escrow ----------
+    function test_quarantinedByDefault() public {
+        _one(MagazineKey.Rarity.Mythic, 1, alice);
+        vm.prank(bob); p.buy(1);
+        for (uint8 i; i <= 7; i++) { (, MagazineKey.RoomState st,,,) = m.roomState(i); assertEq(uint8(st), 0); assertFalse(m.canEnter(alice, i)); assertTrue(m.canEnter(cap, i)); }
+        vm.prank(bob); vm.expectRevert(RoomPass.RoomClosed.selector); p.use(0);
+    }
+    function test_startZeroMeansNow() public {
+        vm.warp(T0 + 5); vm.prank(LEDGER); m.startRoom(2, 0);
+        (,,, uint64 s0, bool open) = m.roomState(2); assertEq(s0, T0 + 5); assertTrue(open);
+    }
+    function test_shutdownThenReopenResetsWindows() public {
+        uint256 id = _one(MagazineKey.Rarity.Common, 1, alice);
+        _start(1, T0);
+        vm.warp(T0 + 6 days); vm.prank(LEDGER); m.shutDownRoom(1);
+        assertFalse(m.canEnter(alice, 1));
+        vm.prank(LEDGER); vm.expectRevert(MagazineKey.NotOpen.selector); m.shutDownRoom(1); // already shut
+        vm.warp(T0 + 20 days); _start(1, uint64(block.timestamp));
+        assertEq(m.accessEnds(id, 1), T0 + 27 days); assertTrue(m.canEnter(alice, 1));
+    }
+    function _usePass(uint256 room) internal { vm.prank(bob); p.use(room); }
+    function test_passEscrowOnUse() public {
+        vm.prank(bob); p.buy(2); _start(0, T0); _start(1, T0);
+        _usePass(0);
+        assertEq(p.balanceOf(bob, 1), 1); assertEq(p.balanceOf(address(p), 1), 1);
+        assertTrue(m.canEnter(bob, 0));
+        vm.prank(bob); vm.expectRevert(RoomPass.PassActive.selector); p.use(0); // one active per room
+        _usePass(1); assertTrue(m.canEnter(bob, 1)); // other room ok
+        assertEq(p.balanceOf(address(p), 1), 2);
+    }
+    function test_reclaimAfterShutdown() public {
+        vm.prank(bob); p.buy(1); _start(0, T0); _usePass(0);
+        vm.warp(T0 + 10 hours); vm.prank(cap); m.shutDownRoom(0);
+        assertFalse(m.canEnter(bob, 0)); // access off immediately
+        assertTrue(p.reclaimable(bob, 0)); assertFalse(p.burnable(bob, 0));
+        vm.warp(T0 + 30 days); // still reclaimable later
+        vm.prank(alice); p.reclaim(bob, 0); // anyone on bob's behalf
+        assertEq(p.balanceOf(bob, 1), 1); assertEq(p.balanceOf(address(p), 1), 0);
+        vm.expectRevert(RoomPass.NotReclaimable.selector); p.reclaim(bob, 0); // no double
+        _start(0, uint64(block.timestamp)); _usePass(0); assertTrue(m.canEnter(bob, 0)); // usable again
+    }
+    function test_reclaimAfterQuarantine() public {
+        vm.prank(bob); p.buy(1); _start(3, T0); _usePass(3);
+        vm.prank(LEDGER); m.quarantineRoom(3);
+        assertFalse(m.canEnter(bob, 3));
+        p.reclaim(bob, 3); assertEq(p.balanceOf(bob, 1), 1);
+        _start(3, T0); _usePass(3); assertTrue(m.canEnter(bob, 3));
+    }
+    function test_noReclaimAfterExpiryThenBurn() public {
+        vm.prank(bob); p.buy(1); _start(0, T0); _usePass(0);
+        vm.warp(T0 + 24 hours); assertFalse(m.canEnter(bob, 0));
+        vm.prank(LEDGER); m.shutDownRoom(0); // close after expiry
+        assertFalse(p.reclaimable(bob, 0)); assertTrue(p.burnable(bob, 0));
+        vm.expectRevert(RoomPass.NotReclaimable.selector); p.reclaim(bob, 0);
+        vm.prank(alice); p.burnExpired(bob, 0);
+        assertEq(p.balanceOf(address(p), 1), 0); assertEq(p.balanceOf(bob, 1), 0);
+        vm.expectRevert(RoomPass.NotExpired.selector); p.burnExpired(bob, 0);
+    }
+    function test_burnExpiredRefusedWhileActive() public {
+        vm.prank(bob); p.buy(1); _start(0, T0); _usePass(0);
+        vm.expectRevert(RoomPass.NotExpired.selector); p.burnExpired(bob, 0);
+    }
+    function test_useAutoBurnsExpired() public {
+        vm.prank(bob); p.buy(2); _start(0, T0); _usePass(0);
+        vm.warp(T0 + 25 hours); _usePass(0);
+        assertEq(p.balanceOf(address(p), 1), 1); assertEq(p.balanceOf(bob, 1), 0);
+        assertTrue(m.canEnter(bob, 0));
+    }
+    function test_useAutoReclaimsClosedDeposit() public {
+        vm.prank(bob); p.buy(1); _start(0, T0); _usePass(0);
+        vm.prank(LEDGER); m.quarantineRoom(0); _start(0, T0);
+        _usePass(0); // old pass returned then re-escrowed
+        assertEq(p.balanceOf(address(p), 1), 1); assertTrue(m.canEnter(bob, 0));
     }
 
     // ---------- admin ----------

@@ -8,19 +8,22 @@ Permanent gate keys for the magazine rooms: one collection, one pool, and a key 
 - **Mint:** `mint()` pays `mintPrice` (10 USDC) to the treasury (0xCF1ac98565DA846E8263604b49C1276Ed78A0981) and gives a random key from the remaining pool. It reverts with `SoldOut` when the pool is empty.
   - Default randomness uses prevrandao + blockhash. On Base the sequencer could in theory bias it, and a contract caller can retry by reverting, so it is fine for fun pulls only. `setRandomSource` can plug in a VRF adapter.
 - **Rooms:** `createRoom(roomId, requiredTrait)` (0 = any key holder, 1..7 = that trait only). `seedDefaultRooms()` creates room 0 (main) and rooms 1..7 (trait rooms). The owner or the current CAPs Mind key holder can create rooms.
-- **Room states** (owner or current CAPs Mind key holder; key = 0x00635ca44339c7c194ef5bc87bf2cd6df04a666d, token id set with `setKey`):
-  - `startRoom(roomId, startTime)` → **Open**: starts or resets the room's own clock. Every eligible key gets a fresh window from `startTime`: Common 7d, Uncommon 14d, Rare 30d. Trait gating and passes apply.
-  - `shutDownRoom(roomId)` → **ShutDown**: only Mythic holders and Cap.
-  - `quarantineRoom(roomId)` → **Quarantined**: only Cap. Mythic holders are locked out.
+- **Room states** (changed by the owner or current CAPs Mind key holder; key = 0x00635ca44339c7c194ef5bc87bf2cd6df04a666d, token id set with `setKey`):
+  - **Quarantined** is the default for every new room, and `quarantineRoom(roomId)` can quarantine from any state. Only Cap gets in; Mythic is locked out.
+  - `startRoom(roomId, startTime)` (0 = now) → **Open**. The timer starts fresh: Common 7d, Uncommon 14d, Rare 30d from startTime. Trait gating and passes apply.
+  - `shutDownRoom(roomId)` → **ShutDown**, only allowed from Open. Only Mythic holders and Cap get in, and the timer stops. Reopening resets it fresh.
+  - Every shutdown or quarantine bumps the room's `closeEpoch` and records `closedAt`, which RoomPass uses for refunds.
 - **Mythic:** free reign in any Open (started) or ShutDown room. Mythic ignores trait gating and has no time limit.
 - **Cap** (owner or current CAPs Mind key holder): `canEnter` is always true, in every room and every state.
 - **Views for apps and future contracts:** `canEnter(wallet, roomId)`, `roomState(roomId)`, `keyInfo(tokenId)`, `accessEnds(tokenId, roomId)`, `roomOpen(roomId)`.
 - Includes Ownable2Step, Pausable (mint), ReentrancyGuard and SafeERC20, and emits an event for every change.
 
 ## RoomPass (ERC-1155, `src/RoomPass.sol`)
-- `buy(n)` costs 1 USDC per pass, paid to the treasury.
-- `use(roomId)` burns one pass for 24h in that one room. It only works while the room is Open and started; otherwise it reverts with `RoomClosed`, so no pass is wasted.
-- An active pass stops working while the room is ShutDown or Quarantined. Its 24h keep counting meanwhile, so it works again only if the room reopens before the 24h run out.
+- `buy(n)` costs 1 USDC per pass, paid to the treasury. Passes are cheap throwaway tokens.
+- `use(roomId)` only works while the room is Open. It moves one pass into the RoomPass contract (escrow) and starts 24h of access to that room. Each user can have one active pass per room.
+- If the room is shut down or quarantined before the 24h ends, access stops at once, and `reclaim(user, roomId)` (anyone can call it) returns the pass like new. The view `reclaimable(user, roomId)` tells the site when to show or trigger this.
+- If the 24h end without a close, the pass is burned by `burnExpired(user, roomId)` (anyone; view `burnable`), or automatically on the user's next `use()` of that room. An expired pass never grants access and is never refunded.
+- On `use()`, an old deposit for that room is settled first: a reclaimable one is returned, an expired one is burned.
 
 ## Setup after deploy (owner = Ledger)
 `setRoomPass(pass)` → `seedDefaultRooms()` → `addEntries(...)` batches → `lockPool()` → `startRoom(id, time)`.

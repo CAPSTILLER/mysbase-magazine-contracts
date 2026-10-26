@@ -26,10 +26,12 @@ interface IRoomPassView {
 /// @notice One collection, one pool. Keys never change. Each room has its OWN clock:
 ///         when a room is started/reset, every eligible holder gets a fresh window from that
 ///         room's startTime: Common 7d, Uncommon 14d, Rare 30d, Mythic forever
-///         Room states: NotStarted, Open, ShutDown, Quarantined.
+///         Room states: Quarantined (default for every new room), Open, ShutDown.
 ///         - Open: rarity windows from startTime + trait gating + RoomPasses.
-///         - ShutDown: only Mythic holders and Cap (owner / current CAPs Mind key holder).
-///         - Quarantined: only Cap. Mythic locked out.
+///         - ShutDown (only from Open; stops the timer, reopening resets it): only Mythic holders and Cap.
+///         - Quarantined (default; allowed from any state): only Cap. Mythic locked out.
+///         Every shutdown/quarantine bumps the room's closeEpoch and records closedAt, so RoomPass can
+///         refund passes used before the close (pull model, no loops here).
 ///         Mythic holders ignore trait gating and time limits in any Open (started) or ShutDown room.
 ///         Cap (owner or current CAPs Mind key holder) can always enter every room.
 ///         canEnter / roomState / keyInfo are stable external views for a future custom-rooms contract.
@@ -52,7 +54,7 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     uint8 public constant DESERT = 6;
     uint8 public constant FOREST = 7;
 
-    enum RoomState { NotStarted, Open, ShutDown, Quarantined }
+    enum RoomState { Quarantined, Open, ShutDown }
 
     struct Entry { Rarity rarity; uint8 trait; string uri; }
     /// requiredTrait 0 = any key holder; 1..7 = only holders of that trait.
@@ -74,6 +76,8 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     uint32[] private _remaining;
     mapping(uint256 => uint32) public entryOf; // tokenId => entry index
     mapping(uint256 => Room) public rooms;
+    mapping(uint256 => uint64) public closeEpoch;                       // roomId => number of closes
+    mapping(uint256 => mapping(uint64 => uint64)) public closedAt;      // roomId => epoch => close time
 
     event EntriesAdded(uint256 from, uint256 count);
     event EntryURISet(uint256 indexed idx, string uri);
@@ -90,7 +94,7 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     event RoomPassSet(address pass);
 
     error ZeroAddress(); error PoolIsLocked(); error PoolNotLocked(); error SoldOut(); error BadTrait();
-    error LengthMismatch(); error NotOperator(); error EmptyPool(); error RoomExists(); error NoRoom(); error BadStart();
+    error LengthMismatch(); error NotOperator(); error EmptyPool(); error RoomExists(); error NoRoom(); error NotOpen();
 
     constructor(string memory name_, string memory symbol_, address owner_, address usdc_, address treasury_,
         uint256 price_, address key_, uint256 keyTokenId_)
@@ -142,7 +146,7 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     function createRoom(uint256 roomId, uint8 requiredTrait) public onlyOperator {
         if (rooms[roomId].exists) revert RoomExists();
         if (requiredTrait > FOREST) revert BadTrait();
-        rooms[roomId] = Room(true, requiredTrait, RoomState.NotStarted, 0);
+        rooms[roomId] = Room(true, requiredTrait, RoomState.Quarantined, 0);
         emit RoomCreated(roomId, requiredTrait);
     }
 
@@ -151,25 +155,34 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
         for (uint8 i; i <= FOREST; i++) if (!rooms[i].exists) createRoom(i, i);
     }
 
-    /// @notice Open/reopen a room and start or reset its clock: every eligible holder gets a fresh
-    ///         window from startTime. Owner or current CAPs Mind key holder.
+    /// @notice Open/reopen a room; its timer starts fresh at startTime (0 = now). Every eligible
+    ///         holder gets a fresh window. Owner or current CAPs Mind key holder.
     function startRoom(uint256 roomId, uint64 startTime) external onlyOperator {
         Room storage r = _room(roomId);
-        if (startTime == 0) revert BadStart();
+        if (startTime == 0) startTime = uint64(block.timestamp);
         r.startTime = startTime; r.state = RoomState.Open;
         emit RoomStarted(roomId, startTime, msg.sender);
     }
 
-    /// @notice Shut a room down: only Mythic holders and Cap can enter; passes stop working.
+    /// @notice Shut down an OPEN room: only Mythic holders and Cap can enter; timer stops; passes in use become reclaimable.
     function shutDownRoom(uint256 roomId) external onlyOperator {
-        _room(roomId).state = RoomState.ShutDown;
+        Room storage r = _room(roomId);
+        if (r.state != RoomState.Open) revert NotOpen();
+        r.state = RoomState.ShutDown;
+        _close(roomId);
         emit RoomShutDown(roomId, msg.sender);
     }
 
-    /// @notice Quarantine a room: only Cap can enter. Mythic holders and passes locked out.
+    /// @notice Quarantine a room (any state): only Cap can enter; passes in use become reclaimable.
     function quarantineRoom(uint256 roomId) external onlyOperator {
         _room(roomId).state = RoomState.Quarantined;
+        _close(roomId);
         emit RoomQuarantined(roomId, msg.sender);
+    }
+
+    function _close(uint256 roomId) internal {
+        uint64 e = ++closeEpoch[roomId];
+        closedAt[roomId][e] = uint64(block.timestamp);
     }
 
     function _room(uint256 roomId) internal view returns (Room storage r) {
