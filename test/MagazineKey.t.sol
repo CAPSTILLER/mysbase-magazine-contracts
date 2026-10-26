@@ -37,7 +37,10 @@ contract MagazineKeyTest is Test {
     }
     // single deterministic entry, minted to `to`
     function _one(MagazineKey.Rarity r, uint8 t, address to) internal returns (uint256 id) {
-        _add(r, t); vm.prank(LEDGER); m.lockPool(); vm.prank(to, to); id = m.mint();
+        _add(r, t); vm.prank(LEDGER); m.lockPool(); id = _mintR(to);
+    }
+    function _mintR(address who) internal returns (uint256 id) {
+        vm.prank(who); id = m.mint(); vm.roll(block.number + m.REVEAL_DELAY() + 1); m.reveal(id);
     }
     function _start(uint256 room, uint64 t) internal { vm.prank(LEDGER); m.startRoom(room, t); }
 
@@ -70,7 +73,7 @@ contract MagazineKeyTest is Test {
         bool[] memory seen = new bool[](n);
         for (uint256 i; i < n; i++) {
             vm.prevrandao(bytes32(uint256(keccak256(abi.encode(i)))));
-            vm.prank(alice, alice); uint256 id = m.mint();
+            uint256 id = _mintR(alice);
             uint256 e = m.entryOf(id); assertFalse(seen[e]); seen[e] = true;
             assertEq(m.tokenURI(id), string.concat("ipfs://e/", vm.toString(e)));
         }
@@ -80,7 +83,7 @@ contract MagazineKeyTest is Test {
     function test_swappableRandomSource() public {
         _load(5, true);
         vm.prank(LEDGER); m.setRandomSource(address(rnd));
-        rnd.set(3); vm.prank(alice, alice); uint256 id = m.mint(); assertEq(m.entryOf(id), 3);
+        rnd.set(3); uint256 id = _mintR(alice); assertEq(m.entryOf(id), 3);
         vm.prank(alice); vm.expectRevert(); m.setRandomSource(address(0));
     }
     function test_mintPaysTreasury() public {
@@ -132,7 +135,7 @@ contract MagazineKeyTest is Test {
         vm.prank(LEDGER); m.setRandomSource(address(rnd));
         uint256[4] memory ids;
         // remaining list swaps; always pick last so order = 3,2,1,0
-        for (uint256 i; i < 4; i++) { rnd.set(3 - i); vm.prank(alice, alice); ids[i] = m.mint(); }
+        for (uint256 i; i < 4; i++) { rnd.set(3 - i); ids[i] = _mintR(alice); }
         _start(0, T0);
         uint256[4] memory dur = [uint256(7 days), 14 days, 30 days, type(uint256).max];
         for (uint256 i; i < 4; i++) {
@@ -396,30 +399,102 @@ contract MagazineKeyTest is Test {
         assertEq(k.name(), "Other"); assertEq(m.name(), "Mysbase Magazine Key") /* test instance name */;
     }
 
-    // ---------- anti-reroll ----------
-    function test_mint_rejectsContractCaller() public {
-        _add(MagazineKey.Rarity.Common, 1); vm.prank(LEDGER); m.lockPool();
-        Reroller c = new Reroller(m);
-        usdc.mint(address(c), 100e6);
-        vm.prank(alice, alice); vm.expectRevert(MagazineKey.ContractCallerNotAllowed.selector); c.go();
+    // ---------- commit-reveal ----------
+    event Sealed(uint256 indexed tokenId, address indexed minter, uint256 targetBlock);
+    function test_commitThenReveal() public {
+        _load(5, true); vm.prank(LEDGER); m.setSealedURI("ipfs://sealed");
+        vm.expectEmit(true, true, false, true); emit Sealed(1, alice, block.number + 2);
+        vm.prank(alice); uint256 id = m.mint();
+        assertEq(m.ownerOf(id), alice); assertFalse(m.isRevealed(id)); assertFalse(m.revealReady(id));
+        assertEq(m.tokenURI(id), "ipfs://sealed"); assertEq(m.sealedCount(), 1); assertEq(m.pendingReveals(0, 10)[0], id);
+        (, , uint8 tr, string memory u) = m.keyInfo(id); assertEq(tr, 0); assertEq(u, "ipfs://sealed");
+        assertEq(m.remaining(), 5);
+        vm.expectRevert(MagazineKey.RevealNotReady.selector); m.reveal(id);
+        vm.roll(block.number + 2); vm.expectRevert(MagazineKey.RevealNotReady.selector); m.reveal(id); // target itself not usable
+        vm.roll(block.number + 1); assertTrue(m.revealReady(id));
+        vm.prank(bob); m.reveal(id); // anyone can reveal
+        assertTrue(m.isRevealed(id)); assertEq(m.remaining(), 4); assertEq(m.sealedCount(), 0);
+        assertEq(m.tokenURI(id), string.concat("ipfs://e/", vm.toString(m.entryOf(id))));
+        vm.expectRevert(MagazineKey.NotSealed.selector); m.reveal(id);
+        vm.expectRevert(MagazineKey.NotSealed.selector); m.reveal(99);
     }
-    function test_mint_eoaSucceeds() public {
-        _add(MagazineKey.Rarity.Common, 1); vm.prank(LEDGER); m.lockPool();
-        vm.prank(alice, alice); uint256 id = m.mint(); assertEq(m.ownerOf(id), alice);
+    function test_outcomeFixedByTargetHash() public {
+        _load(50, true);
+        vm.prank(alice); uint256 id = m.mint();
+        uint256 snap = vm.snapshotState();
+        vm.roll(block.number + 3); m.reveal(id); uint256 e1 = m.entryOf(id);
+        vm.revertToState(snap);
+        vm.roll(block.number + 200); vm.prank(bob); m.reveal(id); // later, different caller: same result
+        assertEq(m.entryOf(id), e1);
     }
-    function test_mint_rejects7702DelegatedEoa() public {
-        _add(MagazineKey.Rarity.Common, 1); vm.prank(LEDGER); m.lockPool();
-        vm.etch(alice, abi.encodePacked(hex"ef0100", address(0xBEEF))); // 7702-style delegation designator
-        vm.prank(alice, alice); vm.expectRevert(MagazineKey.ContractCallerNotAllowed.selector); m.mint();
+    function test_contractWalletAndProbeGetNothing() public {
+        _load(3, true);
+        Reroller c = new Reroller(m); usdc.mint(address(c), 100e6);
+        vm.prank(alice); uint256 id = c.go(); // contract mints fine (smart wallet / Safe / 7702)
+        assertEq(m.ownerOf(id), address(c)); assertFalse(m.isRevealed(id));
+        vm.expectRevert(); c.goAndReveal(); // cannot open in the same tx
+        vm.etch(alice, address(new Reroller(m)).code); // alice now has wallet code (7702 / smart account style)
+        vm.prank(alice); m.mint();
+        vm.roll(block.number + 3);
+        uint256[] memory ids = m.pendingReveals(0, 10); assertEq(ids.length, 2);
+        m.revealBatch(ids); assertEq(m.sealedCount(), 0); assertEq(m.remaining(), 1);
     }
-    function test_mint_rejectsSpoofedOriginMismatch() public {
-        _add(MagazineKey.Rarity.Common, 1); vm.prank(LEDGER); m.lockPool();
-        vm.prank(alice, bob); vm.expectRevert(MagazineKey.ContractCallerNotAllowed.selector); m.mint();
+    function test_supplyCountsSealed() public {
+        _load(2, true);
+        vm.startPrank(alice); m.mint(); m.mint();
+        vm.expectRevert(MagazineKey.SoldOut.selector); m.mint(); vm.stopPrank();
+        assertEq(m.remaining(), 2);
+        vm.roll(block.number + 3); m.revealBatch(m.pendingReveals(0, 10)); assertEq(m.remaining(), 0);
     }
+    function test_sealedCannotEnter() public {
+        _load(1, true); _start(0, T0);
+        vm.prank(alice); uint256 id = m.mint();
+        assertFalse(m.canEnter(alice, 0)); assertEq(m.accessEnds(id, 0), 0);
+        vm.roll(block.number + 3); m.reveal(id); assertTrue(m.canEnter(alice, 0));
+    }
+    function test_historyFallbackAndOperatorRetarget() public {
+        _load(3, true);
+        vm.prank(alice); uint256 id = m.mint();
+        vm.roll(block.number + 1000); // past 256, no EIP-2935 contract in local EVM
+        assertFalse(m.revealReady(id));
+        vm.expectRevert(MagazineKey.HashUnavailable.selector); m.reveal(id);
+        vm.prank(alice); vm.expectRevert(MagazineKey.NotOperator.selector); m.retarget(_arr(id));
+        vm.prank(cap); m.retarget(_arr(id));
+        vm.expectRevert(MagazineKey.RevealNotReady.selector); m.reveal(id);
+        vm.roll(block.number + 3);
+        vm.prank(cap); vm.expectRevert(MagazineKey.StillRecoverable.selector); m.retarget(_arr(id));
+        m.reveal(id); assertTrue(m.isRevealed(id));
+        // mock EIP-2935: once history code exists, old targets are served from it
+        vm.prank(alice); uint256 id2 = m.mint(); uint256 tb = block.number + 2;
+        vm.etch(m.HISTORY(), address(new FakeHistory()).code);
+        vm.roll(block.number + 5000); assertTrue(m.revealReady(id2));
+        vm.prank(cap); vm.expectRevert(MagazineKey.StillRecoverable.selector); m.retarget(_arr(id2));
+        m.reveal(id2); assertTrue(m.isRevealed(id2)); tb;
+    }
+    function _arr(uint256 x) internal pure returns (uint256[] memory a) { a = new uint256[](1); a[0] = x; }
 }
+
+contract FakeHistory { fallback(bytes calldata d) external returns (bytes memory) { return abi.encode(keccak256(d)); } }
 
 contract Reroller {
     MagazineKey m;
     constructor(MagazineKey _m) { m = _m; }
-    function go() external { Mock6(address(m.usdc())).approve(address(m), type(uint256).max); m.mint(); }
+    function go() public returns (uint256) { Mock6(address(m.usdc())).approve(address(m), type(uint256).max); return m.mint(); }
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) { return this.onERC721Received.selector; }
+    function goAndReveal() external { uint256 id = go(); m.reveal(id); }
+}
+
+/// Base mainnet fork: EIP-2935 history contract serves hashes older than 256 blocks.
+contract Eip2935BaseForkTest is Test {
+    function test_fork_eip2935() public {
+        string memory rpc = vm.envOr("BASE_RPC_URL", string(""));
+        if (bytes(rpc).length == 0) return;
+        vm.createSelectFork(rpc);
+        address h = 0x0000F90827F1C53a10cb7A02335B175320002935;
+        assertGt(h.code.length, 0);
+        uint256 b = block.number - 5000;
+        (bool ok, bytes memory r) = h.staticcall(abi.encode(b));
+        assertTrue(ok); assertTrue(abi.decode(r, (bytes32)) != bytes32(0));
+        (ok, ) = h.staticcall(abi.encode(block.number - 9000)); assertFalse(ok);
+    }
 }

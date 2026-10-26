@@ -15,7 +15,7 @@ contract Deploy is Script {
     function run() external {
         vm.startBroadcast();
         // Owner is the Ledger, so the Ledger must afterwards call: setRoomPass(pass), seedDefaultRooms(),
-        // addEntries(...) batches, lockPool(), startRoom(id, time).
+        // setSealedURI(uri), addEntries(...) batches, lockPool(), startRoom(id, time).
         MagazineKey k = new MagazineKey("Mysbase Genesis Key", "MYSGEN", LEDGER, USDC, TREASURY, 10e6, CAPS_MIND_KEY, KEY_TOKEN_ID);
         new RoomPass(LEDGER, USDC, TREASURY, 1e6, address(k), "");
         vm.stopBroadcast();

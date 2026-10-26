@@ -35,10 +35,15 @@ interface IRoomPassView {
 ///         Mythic holders ignore trait gating and time limits in any Open (started) or ShutDown room.
 ///         Cap (owner or current CAPs Mind key holder) can always enter every room.
 ///         canEnter / roomState / keyInfo are stable external views for a future custom-rooms contract.
-/// @dev Randomness: by default uses block.prevrandao + blockhash + nonce + minter. On Base the
-///      sequencer produces blocks and could in theory bias outcomes, and a contract caller can
-///      simulate and revert unwanted pulls. Fine for a fun pull, not for high-value odds.
-///      Owner can plug in an IRandomSource (VRF adapter) later via setRandomSource.
+/// @dev Two-step commit-reveal mint (no rerolls, works for every wallet type):
+///      1. mint(): pays USDC, mints a SEALED key and fixes targetBlock = block.number + REVEAL_DELAY.
+///         The outcome depends on blockhash(targetBlock), which does not exist yet, so nothing in the
+///         mint tx can compute (and revert on) the result.
+///      2. reveal(id) / revealBatch(ids): permissionless after targetBlock. Hash comes from BLOCKHASH
+///         (<=256 blocks) or the EIP-2935 history contract (<=8191 blocks, live on Base). Once the target
+///         block exists the outcome is fixed; nobody chooses it. If a ticket is somehow left >8191 blocks
+///         unrevealed, only the operator (owner / CAPs Mind key) can retarget it - never the holder.
+///      Optional IRandomSource (setRandomSource) replaces the hash word at reveal.
 contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -73,6 +78,14 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     bool public poolLocked;
     uint256 public nextTokenId = 1;
     uint256 private _nonce;
+    uint256 public constant REVEAL_DELAY = 2;
+    address public constant HISTORY = 0x0000F90827F1C53a10cb7A02335B175320002935; // EIP-2935
+    string public sealedURI;
+
+    struct Ticket { uint64 targetBlock; bool revealed; bytes32 seed; }
+    mapping(uint256 => Ticket) public tickets;
+    uint256[] private _sealed;
+    mapping(uint256 => uint256) private _sealedPos; // tokenId => index+1
 
     Entry[] private _entries;
     uint32[] private _remaining;
@@ -88,7 +101,10 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     event RoomStarted(uint256 indexed roomId, uint64 startTime, address by);
     event RoomShutDown(uint256 indexed roomId, address by);
     event RoomQuarantined(uint256 indexed roomId, address by);
-    event Minted(address indexed to, uint256 indexed tokenId, uint256 entry, Rarity rarity, uint8 trait);
+    event Sealed(uint256 indexed tokenId, address indexed minter, uint256 targetBlock);
+    event Revealed(uint256 indexed tokenId, uint256 entryIndex, Rarity rarity, uint8 trait);
+    event Retargeted(uint256 indexed tokenId, uint256 targetBlock);
+    event SealedURISet(string uri);
     event MintPriceSet(uint256 price);
     event TreasurySet(address treasury);
     event KeySet(address key, uint256 tokenId);
@@ -96,7 +112,7 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     event RoomPassSet(address pass);
 
     error ZeroAddress(); error PoolIsLocked(); error PoolNotLocked(); error SoldOut(); error BadTrait();
-    error LengthMismatch(); error NotOperator(); error EmptyPool(); error MaxSupply(); error RoomExists(); error ContractCallerNotAllowed(); error NoRoom(); error NotOpen();
+    error LengthMismatch(); error NotOperator(); error EmptyPool(); error MaxSupply(); error RoomExists(); error NotSealed(); error RevealNotReady(); error HashUnavailable(); error StillRecoverable(); error NoRoom(); error NotOpen();
 
     constructor(string memory name_, string memory symbol_, address owner_, address usdc_, address treasury_,
         uint256 price_, address key_, uint256 keyTokenId_)
@@ -205,32 +221,83 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
         return (r.exists, r.state, r.requiredTrait, r.startTime, roomOpen(roomId));
     }
 
-    // ---------------- mint ----------------
-    /// @notice Pay mintPrice USDC to treasury, get a random key from the remaining pool.
+    // ---------------- mint (commit) ----------------
+    /// @notice Pay mintPrice USDC to treasury and get a SEALED key. Opened by reveal() a few blocks later.
     function mint() external whenNotPaused nonReentrant returns (uint256 tokenId) {
-        // Anti-reroll: only plain EOAs may mint. Blocks contracts (incl. constructor calls via
-        // tx.origin check) and EIP-7702 delegated EOAs (code.length check) that could revert
-        // after inspecting the pulled rarity. Note: smart-contract wallets cannot mint.
-        if (msg.sender != tx.origin || msg.sender.code.length != 0) revert ContractCallerNotAllowed();
         if (!poolLocked) revert PoolNotLocked();
-        uint256 n = _remaining.length;
-        if (n == 0) revert SoldOut();
+        if (nextTokenId > _entries.length) revert SoldOut(); // sealed + revealed never exceed pool
         usdc.safeTransferFrom(msg.sender, treasury, mintPrice);
-        uint256 pick = _random() % n;
+        tokenId = nextTokenId++;
+        uint64 target = uint64(block.number + REVEAL_DELAY);
+        tickets[tokenId] = Ticket(target, false, keccak256(abi.encode(tokenId, msg.sender, ++_nonce, block.prevrandao)));
+        _sealed.push(tokenId); _sealedPos[tokenId] = _sealed.length;
+        _safeMint(msg.sender, tokenId);
+        emit Sealed(tokenId, msg.sender, target);
+    }
+
+    // ---------------- reveal (permissionless) ----------------
+    function reveal(uint256 tokenId) public nonReentrant { _reveal(tokenId); }
+
+    /// @notice Reveal many; skips ids that are already revealed or not ready (keeper friendly).
+    function revealBatch(uint256[] calldata ids) external nonReentrant {
+        for (uint256 i; i < ids.length; i++) if (revealReady(ids[i])) _reveal(ids[i]);
+    }
+
+    function _reveal(uint256 tokenId) internal {
+        Ticket storage t = tickets[tokenId];
+        if (t.targetBlock == 0 || t.revealed) revert NotSealed();
+        if (block.number <= t.targetBlock) revert RevealNotReady();
+        bytes32 h = _hashOf(t.targetBlock);
+        if (h == bytes32(0)) revert HashUnavailable();
+        // Optional external source (e.g. VRF adapter) replaces the block-hash word when set.
+        uint256 r = address(randomSource) != address(0)
+            ? randomSource.randomWord(_ownerOf(tokenId), tokenId)
+            : uint256(keccak256(abi.encode(h, t.seed, tokenId)));
+        uint256 n = _remaining.length;
+        uint256 pick = r % n;
         uint32 picked = _remaining[pick];
         _remaining[pick] = _remaining[n - 1];
         _remaining.pop();
-        tokenId = nextTokenId++;
         entryOf[tokenId] = picked;
-        _safeMint(msg.sender, tokenId);
+        t.revealed = true;
+        uint256 pos = _sealedPos[tokenId]; uint256 last = _sealed[_sealed.length - 1];
+        _sealed[pos - 1] = last; _sealedPos[last] = pos; _sealed.pop(); delete _sealedPos[tokenId];
         Entry storage e = _entries[picked];
-        emit Minted(msg.sender, tokenId, picked, e.rarity, e.trait);
+        emit Revealed(tokenId, picked, e.rarity, e.trait);
     }
 
-    function _random() internal returns (uint256) {
-        uint256 nonce = ++_nonce;
-        if (address(randomSource) != address(0)) return randomSource.randomWord(msg.sender, nonce);
-        return uint256(keccak256(abi.encode(block.prevrandao, blockhash(block.number - 1), nonce, msg.sender)));
+    /// @dev blockhash for <=256 back, EIP-2935 history for <=8191 back, else 0.
+    function _hashOf(uint256 b) internal view returns (bytes32 h) {
+        h = blockhash(b);
+        if (h != bytes32(0) || HISTORY.code.length == 0) return h;
+        (bool ok, bytes memory ret) = HISTORY.staticcall(abi.encode(b));
+        if (ok && ret.length == 32) h = abi.decode(ret, (bytes32));
+    }
+
+    /// @notice Only if a ticket's target hash is truly gone (>8191 blocks, keeper was down): operator
+    ///         gives it a new future target. Holder can never trigger this, so no reroll choice.
+    function retarget(uint256[] calldata ids) external onlyOperator {
+        for (uint256 i; i < ids.length; i++) {
+            Ticket storage t = tickets[ids[i]];
+            if (t.targetBlock == 0 || t.revealed) revert NotSealed();
+            if (block.number <= t.targetBlock || _hashOf(t.targetBlock) != bytes32(0)) revert StillRecoverable();
+            t.targetBlock = uint64(block.number + REVEAL_DELAY);
+            emit Retargeted(ids[i], t.targetBlock);
+        }
+    }
+
+    function isRevealed(uint256 tokenId) public view returns (bool) { return tickets[tokenId].revealed; }
+    function revealReady(uint256 tokenId) public view returns (bool) {
+        Ticket storage t = tickets[tokenId];
+        return t.targetBlock != 0 && !t.revealed && block.number > t.targetBlock && _hashOf(t.targetBlock) != bytes32(0);
+    }
+    function sealedCount() external view returns (uint256) { return _sealed.length; }
+    /// @notice Page through sealed (unrevealed) token ids for the keeper.
+    function pendingReveals(uint256 offset, uint256 limit) external view returns (uint256[] memory ids) {
+        uint256 n = _sealed.length; if (offset >= n) return ids;
+        uint256 end = offset + limit > n ? n : offset + limit;
+        ids = new uint256[](end - offset);
+        for (uint256 i = offset; i < end; i++) ids[i - offset] = _sealed[i];
     }
 
     // ---------------- views ----------------
@@ -246,14 +313,17 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     function entry(uint256 idx) external view returns (Entry memory) { return _entries[idx]; }
 
     /// @notice Clean view for other contracts/apps: a key's permanent rarity, trait, uri and current owner.
+    ///         Sealed keys return trait 0 (ANY), Common and sealedURI. Check isRevealed().
     function keyInfo(uint256 tokenId) external view returns (address holder, Rarity rarity, uint8 trait, string memory uri) {
         holder = _requireOwned(tokenId);
+        if (!isRevealed(tokenId)) return (holder, Rarity.Common, 0, sealedURI);
         Entry storage e = _entries[entryOf[tokenId]];
         return (holder, e.rarity, e.trait, e.uri);
     }
 
     function tokenInfo(uint256 tokenId) external view returns (Rarity rarity, uint8 trait, string memory uri) {
         _requireOwned(tokenId);
+        if (!isRevealed(tokenId)) return (Rarity.Common, 0, sealedURI);
         Entry storage e = _entries[entryOf[tokenId]];
         return (e.rarity, e.trait, e.uri);
     }
@@ -263,7 +333,7 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     function accessEnds(uint256 tokenId, uint256 roomId) public view returns (uint256) {
         _requireOwned(tokenId);
         Room storage r = rooms[roomId];
-        if (!r.exists) return 0;
+        if (!r.exists || !isRevealed(tokenId)) return 0; // sealed keys open nothing
         Entry storage e = _entries[entryOf[tokenId]];
         if (e.rarity == Rarity.Mythic) {
             if (r.state == RoomState.ShutDown || roomOpen(roomId)) return type(uint256).max;
@@ -291,6 +361,7 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
 
     function tokenURI(uint256 tokenId) public view override returns (string memory) {
         _requireOwned(tokenId);
+        if (!isRevealed(tokenId)) return sealedURI;
         return _entries[entryOf[tokenId]].uri;
     }
 
@@ -300,6 +371,7 @@ contract MagazineKey is ERC721Enumerable, Ownable2Step, Pausable, ReentrancyGuar
     function setKey(address key, uint256 tokenId) external onlyOwner { keyContract = IKeyNFT(key); keyTokenId = tokenId; emit KeySet(key, tokenId); }
     function setRandomSource(address s) external onlyOwner { randomSource = IRandomSource(s); emit RandomSourceSet(s); }
     function setRoomPass(address p) external onlyOwner { roomPass = IRoomPassView(p); emit RoomPassSet(p); }
+    function setSealedURI(string calldata u) external onlyOwner { sealedURI = u; emit SealedURISet(u); }
     function pause() external onlyOwner { _pause(); }
     function unpause() external onlyOwner { _unpause(); }
 }
